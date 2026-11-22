@@ -17,6 +17,7 @@ import { StellarModule } from '../stellar/stellar.module';
 import { BlockchainWalletModule } from '../blockchain-wallet/blockchain-wallet.module';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { EncryptionAdminController } from './encryption-admin.controller';
+import { MonthlyPaymentVolume } from './entities/monthly-payment-volume.view-entity';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { EncryptionAdminController } from './encryption-admin.controller';
       FeeHistory,
       AuditLog,
       CronJobLog,
+      MonthlyPaymentVolume,
     ]),
     CronModule,
     RatesModule,
