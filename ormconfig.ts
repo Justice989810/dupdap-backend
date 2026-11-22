@@ -2,6 +2,24 @@ import 'reflect-metadata';
 import { DataSource } from 'typeorm';
 import * as path from 'path';
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+const isProduction = nodeEnv === 'production';
+const isDevelopment = nodeEnv === 'development';
+
+// Hard-disable synchronize outside development. In dev it may be enabled via env.
+const synchronize = isDevelopment
+  ? process.env.DB_SYNCHRONIZE === 'true'
+  : false;
+
+// Startup assertion: never allow synchronize in production.
+if (isProduction && synchronize) {
+  // eslint-disable-next-line no-console
+  console.error(
+    '[ormconfig] FATAL: TypeORM synchronize must be false in production. Refusing to start.',
+  );
+  process.exit(1);
+}
+
 export const AppDataSource = new DataSource({
   type: 'postgres',
   host: process.env.DB_HOST || 'localhost',
@@ -12,7 +30,7 @@ export const AppDataSource = new DataSource({
   entities: [path.join(__dirname, 'src/**/*.entity{.ts,.js}')],
   migrations: [path.join(__dirname, 'src/database/migrations/*{.ts,.js}')],
   migrationsTableName: 'typeorm_migrations',
-  synchronize: false,
+  synchronize,
   extra: {
     max: parseInt(process.env.DB_POOL_MAX || '10', 10),
     min: parseInt(process.env.DB_POOL_MIN || '2', 10),
