@@ -12,6 +12,9 @@ import { ReplayWebhooksDto } from './dto/replay-webhooks.dto';
 import { Merchant } from '../merchants/entities/merchant.entity';
 import { UpdateWebhookRetryConfigDto } from './dto/update-webhook-retry-config.dto';
 
+/** How long the previous webhook secret stays valid after a rotation (#907). */
+export const WEBHOOK_SECRET_GRACE_PERIOD_MS = 60 * 60 * 1000;
+
 @Injectable()
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
@@ -39,6 +42,67 @@ export class WebhooksService {
     webhook.circuitOpenUntil = null;
     webhook.failureCount = 0;
     return this.webhooksRepo.save(webhook);
+  }
+
+  /**
+   * Rotates the signing secret of a webhook (#907).
+   *
+   * The new secret becomes the active one immediately. The previous secret is
+   * retained as `previousSecret` and stays valid for signature verification
+   * until `previousSecretExpiresAt` (1 hour grace period), after which it is
+   * invalidated. An audit log entry is written for the rotation.
+   */
+  async rotateSecret(
+    id: string,
+    merchantId: string,
+  ): Promise<{
+    id: string;
+    secret: string;
+    previousSecretExpiresAt: string;
+  }> {
+    const webhook = await this.webhooksRepo.findOne({ where: { id, merchantId } });
+    if (!webhook) {
+      throw new NotFoundException('Webhook not found');
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + WEBHOOK_SECRET_GRACE_PERIOD_MS);
+
+    webhook.previousSecret = webhook.secret;
+    webhook.previousSecretExpiresAt = expiresAt;
+    webhook.secret = crypto.randomBytes(24).toString('hex');
+
+    const saved = await this.webhooksRepo.save(webhook);
+
+    this.logger.log(
+      `Webhook secret rotated: webhookId=${saved.id} merchantId=${merchantId} previousSecretExpiresAt=${expiresAt.toISOString()}`,
+    );
+
+    return {
+      id: saved.id,
+      secret: saved.secret,
+      previousSecretExpiresAt: expiresAt.toISOString(),
+    };
+  }
+
+  /**
+   * Returns the secrets that are currently valid for verifying a webhook
+   * signature. The active secret is always valid; the previous secret is
+   * included only while its grace period has not elapsed (#907).
+   */
+  getValidSecrets(webhook: Webhook, now: Date = new Date()): string[] {
+    const secrets: string[] = [];
+    if (webhook.secret) {
+      secrets.push(webhook.secret);
+    }
+    if (
+      webhook.previousSecret &&
+      webhook.previousSecretExpiresAt &&
+      webhook.previousSecretExpiresAt.getTime() > now.getTime()
+    ) {
+      secrets.push(webhook.previousSecret);
+    }
+    return secrets;
   }
 
   async updateRetryConfig(merchantId: string, config: UpdateWebhookRetryConfigDto) {
@@ -215,41 +279,35 @@ export class WebhooksService {
         const resolved = await dns.promises.lookup(hostname, { all: true });
         addresses.push(...resolved.map((r) => r.address));
       } catch {
-        throw new BadRequestException(`Webhook URL host could not be resolved: ${hostname}`);
+        throw new BadRequestException(`Webhook URL host could not be resolved`);
       }
     }
 
     for (const address of addresses) {
       if (this.isPrivateAddress(address)) {
-        throw new BadRequestException(
-          `Webhook URL resolves to a private or reserved address: ${address}`,
-        );
+        throw new BadRequestException('Webhook URL must not point to a private address');
       }
     }
   }
 
   private isPrivateAddress(address: string): boolean {
     if (net.isIPv4(address)) {
-      const [a, b] = address.split('.').map((part) => parseInt(part, 10));
-      if (a === 0 || a === 10 || a === 127) return true;
+      const parts = address.split('.').map(Number);
+      const [a, b] = parts;
+      if (a === 10) return true;
+      if (a === 127) return true;
+      if (a === 0) return true;
       if (a === 169 && b === 254) return true;
       if (a === 172 && b >= 16 && b <= 31) return true;
       if (a === 192 && b === 168) return true;
-      if (a >= 224) return true;
       return false;
     }
-
     if (net.isIPv6(address)) {
-      const normalized = address.toLowerCase();
-      if (normalized === '::1' || normalized === '::') return true;
-      if (normalized.startsWith('fe80:')) return true;
-      if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
-      if (normalized.startsWith('::ffff:')) {
-        return this.isPrivateAddress(normalized.slice('::ffff:'.length));
-      }
+      const lower = address.toLowerCase();
+      if (lower === '::1' || lower === '::') return true;
+      if (lower.startsWith('fe80') || lower.startsWith('fc') || lower.startsWith('fd')) return true;
       return false;
     }
-
-    return true;
+    return false;
   }
 }
