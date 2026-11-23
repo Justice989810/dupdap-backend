@@ -49,9 +49,11 @@ export class AdminController {
   ) {}
 
   @Get('merchants')
-  @ApiOperation({ summary: 'List all merchants' })
-  findAllMerchants(@Query('page') page = 1, @Query('limit') limit = 20) {
-    return this.adminService.findAllMerchants(+page, +limit);
+  @ApiOperation({ summary: 'List all merchants (paginated)' })
+  findAllMerchants(@Query() pagination: PaginationDto) {
+    const page = pagination.page ?? 1;
+    const limit = Math.min(pagination.limit ?? 20, 100);
+    return this.adminService.findAllMerchants(page, limit);
   }
 
   @Get('merchants/:id')
