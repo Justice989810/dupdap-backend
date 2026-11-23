@@ -24,6 +24,7 @@ import { PaginationDto } from '../common/dto/pagination.dto';
 import { IdempotencyInterceptor } from './idempotency.interceptor';
 import { Auditable } from '../audit/decorators/auditable.decorator';
 import { TransactionLimitFilter } from './transaction-limit.filter';
+import { PaymentCreationRateLimitService } from './payment-creation-rate-limit.service';
 
 @ApiTags('payments')
 @ApiBearerAuth('bearer')
@@ -32,7 +33,10 @@ import { TransactionLimitFilter } from './transaction-limit.filter';
 @UseFilters(TransactionLimitFilter)
 @Controller('payments')
 export class PaymentsController {
-  constructor(private readonly paymentsService: PaymentsService) {}
+  constructor(
+    private readonly paymentsService: PaymentsService,
+    private readonly paymentCreationRateLimit: PaymentCreationRateLimitService,
+  ) {}
 
   @Post()
   @Scopes('payments:write')
@@ -43,8 +47,13 @@ export class PaymentsController {
   @ApiUnauthorizedResponse({ description: 'Missing or invalid JWT / API key' })
   @ApiForbiddenResponse({ description: 'API key missing payments:write scope' })
   @ApiBadRequestResponse({ description: 'Validation failed' })
+  @ApiResponse({ status: 429, description: 'Payment creation rate limit exceeded (Retry-After header set)' })
   @ApiResponse({ status: 500, description: 'Internal server error' })
-  create(@Request() req: { user: { merchantId: string } }, @Body() dto: CreatePaymentDto) {
+  async create(
+    @Request() req: { user: { merchantId: string }; headers: Record<string, string | string[] | undefined> },
+    @Body() dto: CreatePaymentDto,
+  ) {
+    await this.enforceCreationRateLimit(req);
     return this.paymentsService.create(req.user.merchantId, dto);
   }
 
@@ -144,6 +153,20 @@ export class PaymentsController {
     @Body() dto: RefundPaymentDto,
   ) {
     return this.paymentsService.refund(id, req.user.merchantId, dto);
+  }
+
+  /**
+   * Enforces the per-API-key payment creation rate limit (#809). Requests
+   * without an API key (bearer JWT sessions) are not limited here.
+   */
+  private async enforceCreationRateLimit(req: {
+    user: { merchantId: string };
+    headers: Record<string, string | string[] | undefined>;
+  }): Promise<void> {
+    const rawKey = req.headers['x-api-key'];
+    const apiKey = Array.isArray(rawKey) ? rawKey[0] : rawKey;
+    if (typeof apiKey !== 'string' || apiKey.trim().length === 0) return;
+    await this.paymentCreationRateLimit.checkAndIncrement(apiKey.trim());
   }
 }
 

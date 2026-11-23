@@ -20,6 +20,8 @@ import { PaymentEscrowService } from '../blockchain-wallet/payment-escrow.servic
 import { AmlModule } from '../aml/aml.module';
 import { PaymentsSorobanListener } from './payments-soroban.listener';
 import { TransactionLimitsService } from './transaction-limits.service';
+import { PaymentCreationRateLimitService } from './payment-creation-rate-limit.service';
+import { RuntimeConfigModule } from '../runtime-config/runtime-config.module';
 import { AdminAlertModule } from '../alerts/admin-alert.module';
 import { PrometheusModule } from '../prometheus/prometheus.module';
 
@@ -36,9 +38,10 @@ import { PrometheusModule } from '../prometheus/prometheus.module';
     PrometheusModule,
     forwardRef(() => AmlModule),
     SettlementsModule,
+    RuntimeConfigModule,
   ],
   controllers: [PaymentsController, PublicPaymentController, DisputesController],
-  providers: [PaymentsService, DisputesService, IdempotencyInterceptor, PaymentEscrowService, PaymentsSorobanListener, TransactionLimitsService],
+  providers: [PaymentsService, DisputesService, IdempotencyInterceptor, PaymentEscrowService, PaymentsSorobanListener, TransactionLimitsService, PaymentCreationRateLimitService],
   exports: [PaymentsService],
 })
 export class PaymentsModule {}
