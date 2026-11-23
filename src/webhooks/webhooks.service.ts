@@ -12,6 +12,36 @@ import { ReplayWebhooksDto } from './dto/replay-webhooks.dto';
 import { Merchant } from '../merchants/entities/merchant.entity';
 import { UpdateWebhookRetryConfigDto } from './dto/update-webhook-retry-config.dto';
 
+/**
+ * Returns true when a webhook's event subscription matches the emitted event.
+ *
+ * Matching semantics:
+ * - `*` matches every event.
+ * - Exact names match only themselves (e.g. `payment.created`).
+ * - Glob patterns use `*` as a wildcard for any sequence of characters
+ *   (e.g. `payment.*` matches `payment.created` and `payment.failed`).
+ */
+export function matchesEventSubscription(subscriptions: string[], event: string): boolean {
+  if (!Array.isArray(subscriptions)) {
+    return false;
+  }
+  return subscriptions.some((pattern) => {
+    if (pattern === '*') {
+      return true;
+    }
+    if (pattern === event) {
+      return true;
+    }
+    if (pattern.includes('*')) {
+      const regex = new RegExp(
+        '^' + pattern.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$',
+      );
+      return regex.test(event);
+    }
+    return false;
+  });
+}
+
 /** How long the previous webhook secret stays valid after a rotation (#907). */
 export const WEBHOOK_SECRET_GRACE_PERIOD_MS = 60 * 60 * 1000;
 
@@ -126,9 +156,7 @@ export class WebhooksService {
       where: { merchantId, isActive: true },
     });
 
-    const matchingWebhooks = webhooks.filter(
-      (w) => w.events.includes(event) || w.events.includes('*'),
-    );
+    const matchingWebhooks = webhooks.filter((w) => matchesEventSubscription(w.events, event));
 
     // Generate the event ID once so it stays stable across retries (#908).
     const eventId = crypto.randomUUID();
@@ -290,8 +318,13 @@ export class WebhooksService {
 
     const hostname = parsed.hostname;
     if (net.isIP(hostname)) {
-      if (this.isPrivateIp(hostname)) {
-        throw new BadRequestException('Webhook URL must not target a private address');
+    for (const address of addresses) {
+      if (this.isPrivateAddress(address)) {
+        throw new BadRequestException('Webhook URL must not point to a private or internal address');
+      }
+    }
+    return;
+  }
       }
       return;
     }
@@ -306,6 +339,8 @@ export class WebhooksService {
     for (const { address } of addresses) {
       if (this.isPrivateIp(address)) {
         throw new BadRequestException('Webhook URL must not target a private address');
+      }
+    }
       }
     }
   }

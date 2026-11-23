@@ -30,6 +30,8 @@ import { PaginationDto } from '../common/dto/pagination.dto';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { Auditable } from '../audit/decorators/auditable.decorator';
 import { AdminTwoFactorGuard } from '../auth/guards/admin-two-factor.guard';
+import { AuditService } from '../audit/audit.service';
+import { TokenBlacklistService } from '../auth/services/token-blacklist.service';
 
 const EXPORT_DAILY_LIMIT = Number(process.env.ANALYTICS_EXPORT_DAILY_LIMIT ?? 5);
 const EXPORT_SYNC_MAX_DAYS = 30;
@@ -46,6 +48,8 @@ export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly ratesService: RatesService,
+    private readonly auditService: AuditService,
+    private readonly tokenBlacklistService: TokenBlacklistService,
   ) {}
 
   @Get('merchants')
@@ -65,23 +69,56 @@ export class AdminController {
   @Patch('merchants/:id/status')
   @Auditable({ action: 'MERCHANT_STATUS_UPDATED', resource: 'merchant' })
   @ApiOperation({ summary: 'Update merchant status' })
-  updateStatus(
+  async updateStatus(
     @Param('id') id: string,
     @Body('status') status: MerchantStatus,
     @Req() req: Request & { user: { id: string; merchantId?: string } },
   ) {
-    return this.adminService.updateMerchantStatus(id, status, req.user?.id ?? req.user?.merchantId);
+    const actorId = req.user?.id ?? req.user?.merchantId;
+    const before = await this.adminService.findOneMerchant(id);
+    const result = await this.adminService.updateMerchantStatus(id, status, actorId);
+    if (status === MerchantStatus.SUSPENDED) {
+      await this.tokenBlacklistService.blacklistAllForMerchant(id);
+    }
+    await this.auditService.log({
+      actorId,
+      action: 'MERCHANT_STATUS_UPDATED',
+      resourceType: 'merchant',
+      resourceId: id,
+      before: { status: before?.status },
+      after: { status },
+      ip: req.ip,
+    });
+    return result;
   }
 
   @Patch('merchants/bulk/status')
   @Auditable({ action: 'MERCHANT_STATUS_BULK_UPDATED', resource: 'merchant' })
   @ApiOperation({ summary: 'Bulk update merchant status' })
-  bulkUpdateStatus(
+  async bulkUpdateStatus(
     @Body('ids') ids: string[],
     @Body('status') status: MerchantStatus,
     @Req() req: Request & { user: { id: string; merchantId?: string } },
   ) {
-    return this.adminService.bulkUpdateMerchantStatus(ids, status, req.user?.id ?? req.user?.merchantId);
+    const actorId = req.user?.id ?? req.user?.merchantId;
+    const result = await this.adminService.bulkUpdateMerchantStatus(ids, status, actorId);
+    if (status === MerchantStatus.SUSPENDED) {
+      await Promise.all(
+        ids.map((merchantId) =>
+          this.tokenBlacklistService.blacklistAllForMerchant(merchantId),
+        ),
+      );
+    }
+    await this.auditService.log({
+      actorId,
+      action: 'MERCHANT_STATUS_BULK_UPDATED',
+      resourceType: 'merchant',
+      resourceId: ids.join(','),
+      before: null,
+      after: { ids, status },
+      ip: req.ip,
+    });
+    return result;
   }
 
   @Get('stats')
@@ -99,16 +136,54 @@ export class AdminController {
   @Patch('fees')
   @Auditable({ action: 'FEE_UPDATED', resource: 'fee_config' })
   @ApiOperation({ summary: 'Update a global fee rate' })
-  updateFee(
+  async updateFee(
     @Body() dto: UpdateFeeDto,
     @Req() req: Request & { user: { id: string; merchantId?: string } },
   ) {
-    return this.adminService.updateGlobalFee(
+    const actorId = req.user.id ?? req.user?.merchantId ?? 'system';
+    const before = await this.adminService.getGlobalFees();
+    const result = await this.adminService.updateGlobalFee(
       dto.feeType,
       dto.newRate,
-      req.user.id ?? req.user?.merchantId ?? 'system',
+      actorId,
       dto.reason,
     );
+    await this.auditService.log({
+      actorId,
+      action: 'FEE_UPDATED',
+      resourceType: 'fee_config',
+      resourceId: dto.feeType,
+      before: { feeType: dto.feeType, rate: before?.[dto.feeType] },
+      after: { feeType: dto.feeType, rate: dto.newRate, reason: dto.reason },
+      ip: req.ip,
+    });
+    return result;
+  }
+
+  // ── Audit Log Query (#925) ─────────────────────────────────────────────────
+
+  @Get('audit-log')
+  @ApiOperation({ summary: 'Query the admin audit log with filters' })
+  queryAuditLog(
+    @Query('actorId') actorId?: string,
+    @Query('action') action?: string,
+    @Query('resourceType') resourceType?: string,
+    @Query('resourceId') resourceId?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('page') page = 1,
+    @Query('limit') limit = 20,
+  ) {
+    return this.auditService.query({
+      actorId,
+      action,
+      resourceType,
+      resourceId,
+      from: from ? new Date(from) : undefined,
+      to: to ? new Date(to) : undefined,
+      page: +page,
+      limit: +limit,
+    });
   }
 
   // ── Cache Management ──────────────────────────────────────────────────────
@@ -218,17 +293,28 @@ export class AdminController {
 
   @Post('users')
   @ApiOperation({ summary: 'Create a new admin user (SUPERADMIN only)' })
-  createAdmin(
+  async createAdmin(
     @Body() dto: { email: string; password: string; businessName: string },
     @Req() req: Request & { user: { id: string; merchantId?: string; role: MerchantRole } },
   ) {
-    return this.adminService.createAdmin(
+    const actorId = req.user?.id ?? req.user?.merchantId;
+    const result = await this.adminService.createAdmin(
       dto.email,
       dto.password,
       dto.businessName,
       req.user.role,
-      req.user?.id ?? req.user?.merchantId,
+      actorId,
     );
+    await this.auditService.log({
+      actorId,
+      action: 'ADMIN_USER_CREATED',
+      resourceType: 'admin_user',
+      resourceId: (result as { id?: string })?.id ?? dto.email,
+      before: null,
+      after: { email: dto.email, businessName: dto.businessName },
+      ip: req.ip,
+    });
+    return result;
   }
 
   @Delete('users/:id')
