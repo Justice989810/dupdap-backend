@@ -17,7 +17,8 @@ import { StellarModule } from '../stellar/stellar.module';
 import { BlockchainWalletModule } from '../blockchain-wallet/blockchain-wallet.module';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { EncryptionAdminController } from './encryption-admin.controller';
-import { MonthlyPaymentVolume } from './entities/monthly-payment-volume.view-entity';
+import { AnalyticsExportService } from './analytics-export.service';
+import { AnalyticsExportController } from './analytics-export.controller';
 
 @Module({
   imports: [
@@ -37,8 +38,8 @@ import { MonthlyPaymentVolume } from './entities/monthly-payment-volume.view-ent
     StellarModule,
     BlockchainWalletModule,
   ],
-  controllers: [AdminController, CronAdminController, EncryptionAdminController],
-  providers: [AdminService, IpAllowlistGuard],
+  controllers: [AdminController, CronAdminController, EncryptionAdminController, AnalyticsExportController],
+  providers: [AdminService, IpAllowlistGuard, AnalyticsExportService],
   exports: [AdminService, TypeOrmModule],
 })
 export class AdminModule {}
