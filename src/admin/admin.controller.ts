@@ -30,6 +30,7 @@ import { PaginationDto } from '../common/dto/pagination.dto';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { Auditable } from '../audit/decorators/auditable.decorator';
 import { AdminTwoFactorGuard } from '../auth/guards/admin-two-factor.guard';
+import { WebhooksService } from '../webhooks/webhooks.service';
 import { AuditService } from '../audit/audit.service';
 import { TokenBlacklistService } from '../auth/services/token-blacklist.service';
 
@@ -48,6 +49,7 @@ export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly ratesService: RatesService,
+    private readonly webhooksService: WebhooksService,
     private readonly auditService: AuditService,
     private readonly tokenBlacklistService: TokenBlacklistService,
   ) {}
@@ -308,6 +310,31 @@ export class AdminController {
     const end = new Date(to).getTime();
     if (Number.isNaN(start) || Number.isNaN(end) || end < start) return 0;
     return Math.ceil((end - start) / (24 * 60 * 60 * 1000));
+  }
+
+  // ── Webhook Delivery Logs (#914) ───────────────────────────────────────────
+
+  @Get('webhooks/delivery-logs')
+  @ApiOperation({
+    summary: 'Query webhook delivery logs with pagination',
+    description:
+      'Returns paginated webhook delivery log entries. Optionally filter by ' +
+      'merchantId, webhookId, and delivery status.',
+  })
+  getWebhookDeliveryLogs(
+    @Query('page') page = 1,
+    @Query('limit') limit = 20,
+    @Query('merchantId') merchantId?: string,
+    @Query('webhookId') webhookId?: string,
+    @Query('status') status?: string,
+  ) {
+    return this.webhooksService.findDeliveryLogs({
+      page: +page,
+      limit: +limit,
+      merchantId,
+      webhookId,
+      status,
+    });
   }
 
   // ── Admin User Management with 2FA (#707) ──────────────────────────────────

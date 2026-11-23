@@ -18,6 +18,8 @@ import { StellarModule } from '../stellar/stellar.module';
 import { BlockchainWalletModule } from '../blockchain-wallet/blockchain-wallet.module';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { EncryptionAdminController } from './encryption-admin.controller';
+import { WebhookDeliveryLog } from '../webhooks/entities/webhook-delivery-log.entity';
+import { WebhooksModule } from '../webhooks/webhooks.module';
 import { AmlModule } from '../aml/aml.module';
 import { AnalyticsExportService } from './analytics-export.service';
 import { AnalyticsExportController } from './analytics-export.controller';
@@ -32,6 +34,7 @@ import { AnalyticsExportController } from './analytics-export.controller';
       FeeHistory,
       AuditLog,
       CronJobLog,
+      WebhookDeliveryLog,
       MonthlyPaymentVolume,
     ]),
     CronModule,
@@ -39,6 +42,7 @@ import { AnalyticsExportController } from './analytics-export.controller';
     CacheModule,
     StellarModule,
     BlockchainWalletModule,
+    WebhooksModule,
     AmlModule,
   ],
   controllers: [AdminController, CronAdminController, EncryptionAdminController, AnalyticsExportController],

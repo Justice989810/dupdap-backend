@@ -111,6 +111,40 @@ describe('WebhooksService', () => {
     expect(webhookDelivery.enqueueDelivery).toHaveBeenCalledWith(webhooks[0], 'payment.completed', expect.any(String));
   });
 
+  describe('delivery response validation', () => {
+    const buildResponse = (status: number, contentType: string | null, body: string) => ({
+      status,
+      headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+      text: jest.fn(async () => body),
+    });
+
+    it('treats a 200 HTML response as a delivery failure', async () => {
+      const response = buildResponse(200, 'text/html; charset=utf-8', '<html><body>Error</body></html>');
+
+      const result = await (service as any).validateDeliveryResponse(response);
+
+      expect(result.success).toBe(false);
+      expect(result.body).toBe('<html><body>Error</body></html>');
+    });
+
+    it('treats a 200 JSON response as a successful delivery', async () => {
+      const response = buildResponse(200, 'application/json', '{"ok":true}');
+
+      const result = await (service as any).validateDeliveryResponse(response);
+
+      expect(result.success).toBe(true);
+    });
+
+    it('treats a non-2xx response as a failure and captures the body', async () => {
+      const response = buildResponse(500, 'application/json', '{"error":"boom"}');
+
+      const result = await (service as any).validateDeliveryResponse(response);
+
+      expect(result.success).toBe(false);
+      expect(result.body).toBe('{"error":"boom"}');
+    });
+  });
+
   describe('event subscription matching', () => {
     it('matches an exact event name', async () => {
       const webhook = { id: 'hook-1', merchantId: 'merchant-1', events: ['payment.completed'], isActive: true };
@@ -139,6 +173,8 @@ describe('WebhooksService', () => {
       await service.dispatch('merchant-1', 'refund.created', { id: 'r-1' });
 
       expect(webhookDelivery.enqueueDelivery).not.toHaveBeenCalled();
+    });
+  });
     });
   });
 });
