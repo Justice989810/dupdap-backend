@@ -144,11 +144,13 @@ export class AdminController {
     description:
       'Returns merchants ranked by total settled USD volume for the given period. ' +
       'Supports cursor-based pagination — pass the `nextCursor` from the previous ' +
-      'response as the `cursor` query parameter to get the next page.',
+      'response as the `cursor` query parameter to get the next page. ' +
+      'The `limit` parameter defaults to 20 and is capped at 100.',
   })
   @ApiResponse({ status: 200, type: TopMerchantsResponseDto })
   getTopMerchants(@Query() query: TopMerchantsQueryDto): Promise<TopMerchantsResponseDto> {
-    return this.adminService.getTopMerchants(query);
+    const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 100);
+    return this.adminService.getTopMerchants({ ...query, limit });
   }
 
   // ── Analytics Export (#905) ────────────────────────────────────────────────

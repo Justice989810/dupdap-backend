@@ -30,6 +30,7 @@ import { AnalyticsExportController } from './analytics-export.controller';
       FeeHistory,
       AuditLog,
       CronJobLog,
+      MonthlyPaymentVolume,
     ]),
     CronModule,
     RatesModule,
