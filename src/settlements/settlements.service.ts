@@ -3,10 +3,11 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Raw, Repository } from 'typeorm';
+import { EntityManager, Raw, Repository } from 'typeorm';
 import axios from 'axios';
 import { Settlement, SettlementStatus } from './entities/settlement.entity';
 import { Payment, PaymentStatus } from '../payments/entities/payment.entity';
+import { Merchant } from '../merchants/entities/merchant.entity';
 import { AuditLog } from '../audit/entities/audit-log.entity';
 import { AdminAlertService } from '../alerts/admin-alert.service';
 import { AdminAlertType } from '../alerts/admin-alert.entity';
@@ -55,6 +56,34 @@ export class SettlementsService {
   private readonly settlementsRepo: Repository<Settlement>;
   private readonly paymentsRepo: Repository<Payment>;
   private readonly auditLogRepo: Repository<AuditLog>;
+
+  // ── Settlement creation ────────────────────────────────────────────────────
+
+  // Must be called with the transaction manager that is confirming the payment:
+  // every write goes through `manager`, so the settlement and the payment status
+  // commit or roll back together. Callers must dispatch webhooks after commit.
+  async initiateSettlement(payment: Payment, manager: EntityManager): Promise<Settlement> {
+    const merchant = await manager.findOneOrFail(Merchant, { where: { id: payment.merchantId } });
+
+    const totalUsd = Number(payment.amountUsd);
+    const feeUsd = totalUsd * Number(merchant.feeRate);
+
+    const settlement = await manager.save(
+      manager.create(Settlement, {
+        merchantId: payment.merchantId,
+        totalAmountUsd: totalUsd.toFixed(6),
+        feeAmountUsd: feeUsd.toFixed(6),
+        netAmountUsd: (totalUsd - feeUsd).toFixed(6),
+        status: SettlementStatus.PENDING,
+      }),
+    );
+
+    payment.status = PaymentStatus.SETTLING;
+    payment.settlementId = settlement.id;
+    await manager.save(payment);
+
+    return settlement;
+  }
 
   // ── Small-payment batching ─────────────────────────────────────────────────
 
@@ -107,6 +136,7 @@ export class SettlementsService {
         { attempts: this.retryConfig.settlement.maxAttempts + 1 },
       );
     }
+  }
   }
 
   // ── Admin approval workflow (#445) ─────────────────────────────────────────
