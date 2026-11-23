@@ -186,6 +186,27 @@ export class AdminController {
     });
   }
 
+  // ── AML Threshold Management (#953) ────────────────────────────────────────
+
+  @Get('aml/thresholds')
+  @ApiOperation({ summary: 'Get AML high-value thresholds (default and per-country)' })
+  getAmlThresholds() {
+    return this.adminService.getAmlThresholds();
+  }
+
+  @Patch('aml/thresholds')
+  @Auditable({ action: 'AML_THRESHOLD_UPDATED', resource: 'aml_config' })
+  @ApiOperation({ summary: 'Update AML high-value thresholds (default and/or per-country)' })
+  updateAmlThresholds(
+    @Body() dto: { defaultThreshold?: number; countryThresholds?: Record<string, number> },
+    @Req() req: Request & { user: { id: string; merchantId?: string } },
+  ) {
+    return this.adminService.updateAmlThresholds(
+      dto,
+      req.user?.id ?? req.user?.merchantId ?? 'system',
+    );
+  }
+
   // ── Cache Management ──────────────────────────────────────────────────────
 
   @Post('cache/rates/refresh')

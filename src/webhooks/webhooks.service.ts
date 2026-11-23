@@ -12,6 +12,9 @@ import { ReplayWebhooksDto } from './dto/replay-webhooks.dto';
 import { Merchant } from '../merchants/entities/merchant.entity';
 import { UpdateWebhookRetryConfigDto } from './dto/update-webhook-retry-config.dto';
 
+/** Default maximum number of webhook endpoints a single merchant may register (#919). */
+const DEFAULT_MAX_WEBHOOKS_PER_MERCHANT = 10;
+
 /**
  * Returns true when a webhook's event subscription matches the emitted event.
  *
@@ -49,6 +52,9 @@ export const WEBHOOK_SECRET_GRACE_PERIOD_MS = 60 * 60 * 1000;
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
 
+  /** Configurable cap on webhook endpoints per merchant (#919). */
+  private readonly maxWebhooksPerMerchant: number;
+
   constructor(
     @InjectRepository(Webhook)
     private webhooksRepo: Repository<Webhook>,
@@ -61,7 +67,13 @@ export class WebhooksService {
     @Optional()
     @InjectRepository(Merchant)
     private merchantsRepo?: Repository<Merchant>,
-  ) {}
+  ) {
+    const configured = Number(process.env.MAX_WEBHOOKS_PER_MERCHANT);
+    this.maxWebhooksPerMerchant =
+      Number.isFinite(configured) && configured > 0
+        ? Math.floor(configured)
+        : DEFAULT_MAX_WEBHOOKS_PER_MERCHANT;
+  }
 
   /** Admin: close an open webhook circuit and clear the failure streak (#457). */
   async resetCircuit(webhookId: string): Promise<Webhook> {
@@ -199,6 +211,7 @@ export class WebhooksService {
 
   async create(merchantId: string, url: string, events: string[], secret?: string) {
     await this.assertPublicUrl(url);
+    await this.assertUnderEndpointLimit(merchantId);
 
     const webhook = this.webhooksRepo.create({
       merchantId,
@@ -207,6 +220,19 @@ export class WebhooksService {
       secret: secret ?? crypto.randomBytes(24).toString('hex'),
     });
     return this.webhooksRepo.save(webhook);
+  }
+
+  /**
+   * Rejects webhook creation when the merchant already has the maximum number
+   * of registered endpoints (#919).
+   */
+  private async assertUnderEndpointLimit(merchantId: string): Promise<void> {
+    const count = await this.webhooksRepo.count({ where: { merchantId } });
+    if (count >= this.maxWebhooksPerMerchant) {
+      throw new BadRequestException(
+        `Webhook endpoint limit reached: a merchant may register at most ${this.maxWebhooksPerMerchant} webhook endpoints`,
+      );
+    }
   }
 
   async findAll(merchantId: string) {
@@ -318,17 +344,6 @@ export class WebhooksService {
 
     const hostname = parsed.hostname;
     if (net.isIP(hostname)) {
-    for (const address of addresses) {
-      if (this.isPrivateAddress(address)) {
-        throw new BadRequestException('Webhook URL must not point to a private or internal address');
-      }
-    }
-    return;
-  }
-      }
-      return;
-    }
-
     let addresses: dns.LookupAddress[];
     try {
       addresses = await dns.promises.lookup(hostname, { all: true });
@@ -337,8 +352,8 @@ export class WebhooksService {
     }
 
     for (const { address } of addresses) {
-      if (this.isPrivateIp(address)) {
-        throw new BadRequestException('Webhook URL must not target a private address');
+      if (this.isPrivateAddress(address)) {
+        throw new BadRequestException('Webhook URL must not point to a private or internal address');
       }
     }
       }
@@ -348,6 +363,19 @@ export class WebhooksService {
   private isPrivateIp(ip: string): boolean {
     if (net.isIPv4(ip)) {
       const parts = ip.split('.').map(Number);
+      const [a, b] = parts;
+      if (a === 10) return true;
+      if (a === 127) return true;
+      if (a === 0) return true;
+      if (a === 169 && b === 254) return true;
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      if (a === 192 && b === 168) return true;
+      return false;
+    }
+    if (net.isIPv6(ip)) {
+      const normalized = ip.toLowerCase();
+      if (normalized === '::1' || normalized === '::') return true;
+      if (normalized.startsWith('fc')
       const [a, b] = parts;
       if (a === 10) return true;
       if (a === 127) return true;

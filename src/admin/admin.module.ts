@@ -18,6 +18,7 @@ import { StellarModule } from '../stellar/stellar.module';
 import { BlockchainWalletModule } from '../blockchain-wallet/blockchain-wallet.module';
 import { IpAllowlistGuard } from '../security/ip-allowlist.guard';
 import { EncryptionAdminController } from './encryption-admin.controller';
+import { AmlModule } from '../aml/aml.module';
 import { AnalyticsExportService } from './analytics-export.service';
 import { AnalyticsExportController } from './analytics-export.controller';
 
@@ -38,6 +39,7 @@ import { AnalyticsExportController } from './analytics-export.controller';
     CacheModule,
     StellarModule,
     BlockchainWalletModule,
+    AmlModule,
   ],
   controllers: [AdminController, CronAdminController, EncryptionAdminController, AnalyticsExportController],
   providers: [AdminService, AuditService, IpAllowlistGuard, AnalyticsExportService],

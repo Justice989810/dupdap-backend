@@ -1,8 +1,18 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards, HttpException, HttpStatus } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { IsArray, IsBoolean, IsOptional, IsString, IsUrl } from 'class-validator';
 import { SuperAdminGuard } from '../auth/super-admin.guard';
 import { WebhooksService } from './webhooks.service';
+
+const DEFAULT_MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT = 10;
+
+function getMaxWebhookEndpointsPerMerchant(): number {
+  const raw = process.env.MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT;
+  const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT;
+}
 
 export class CreateWebhookDto {
   @ApiProperty({ example: 'https://example.com/hooks/payments' })
@@ -74,9 +84,26 @@ export class WebhooksController {
     return this.webhooksService.findAll();
   }
 
+  @Get('merchant/:merchantId')
+  async listByMerchant(@Param('merchantId') merchantId: string) {
+    return this.webhooksService.findByMerchant(merchantId);
+  }
+
   @Post()
   @ApiOperation({ summary: 'Create a webhook subscription' })
-  create(@Body() dto: CreateWebhookDto) {
+  async create(@Body() dto: CreateWebhookDto) {
+    const merchantId = (dto as any)?.merchantId;
+    if (merchantId) {
+      const existing = await this.webhooksService.findByMerchant(merchantId);
+      const max = getMaxWebhookEndpointsPerMerchant();
+      if (existing.length >= max) {
+        throw new HttpException(
+          `Webhook endpoint limit reached: a merchant may register at most ${max} webhook endpoints`,
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+    }
+
     return this.webhooksService.create(dto);
   }
 
