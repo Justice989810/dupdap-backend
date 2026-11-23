@@ -15,7 +15,8 @@ import { Merchant } from '../../merchants/entities/merchant.entity';
 import { Settlement } from '../../settlements/entities/settlement.entity';
 import { numericColumnTransformer } from '../../database/numeric-column.transformer';
 import { encryptedColumnTransformer } from '../../security/encrypted-column.transformer';
-import { maskEmail } from '../utils/mask-email.util';
+@Index(['status', 'expiresAt'])
+@Index('UQ_payments_stellar_mem
 
 export enum PaymentStatus {
   PENDING = 'pending',
@@ -91,7 +92,11 @@ export class Payment {
   @Column({ nullable: true })
   description: string;
 
-  @Column({ nullable: true, transformer: encryptedColumnTransformer('payments.customerEmail') })
+  @Column({
+    type: 'text',
+    nullable: true,
+    transformer: encryptedColumnTransformer('payments.customerEmail'),
+  })
   @Transform(({ value }) => maskEmail(value), { toPlainOnly: true })
   customerEmail: string;
 
