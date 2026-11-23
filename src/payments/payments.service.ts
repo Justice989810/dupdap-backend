@@ -25,6 +25,12 @@ import { WebhooksService } from '../webhooks/webhooks.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { MerchantsService } from '../merchants/merchants.service';
 import { PaginatedResponseDto } from '../common/dto/pagination.dto';
+import { PaymentEscrowService, PaymentExpiredError } from '../blockch
+import { StellarService } from '../stellar/stellar.service';
+import { WebhooksService } from '../webhooks/webhooks.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { MerchantsService } from '../merchants/merchants.service';
+import { PaginatedResponseDto } from '../common/dto/pagination.dto';
 import { PaymentEscrowService, PaymentExpiredError } from '../blockchain-wallet/payment-escrow.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { AmlService } from '../aml/aml.service';
@@ -32,6 +38,7 @@ import { TransactionLimitsService } from './transaction-limits.service';
 import { PaymentConfirmedEventDto } from '../stellar/soroban-event.dto';
 
 const DEFAULT_EXPIRY_MINUTES = 30;
+const MAX_EXPIRY_MINUTES = 1440;
 
 // Events emitted per payment in a batch — mirrors contract PaymentCreated events
 export interface PaymentCreatedEvent {
@@ -283,7 +290,16 @@ export class PaymentsService {
     for (const p of saved) {
       this.logger.log(`PaymentCreated ${p.id} merchant=${merchantId} (batch)`);
     }
-    return { paymentIds: saved.map((p) => p.id), count: saved.length };
+    return {
+      paymentIds: saved.map((p) => p.id),
+      count: saved.length,
+      items: saved.map((p) => ({
+        paymentId: p.id,
+        reference: p.reference,
+        stellarUri: this.buildStellarUri(p),
+        qrCode: p.qrCode,
+      })),
+    };
   }
 
   async refund(
@@ -390,7 +406,6 @@ export class PaymentsService {
 
     return rows.map((r) => ({ status: r.status, count: Number(r.count), totalUsd: r.total }));
   }
-  }
 
   async findOne(id: string, merchantId: string): Promise<Payment> {
     const payment = await this.paymentsRepo.findOne({ where: { id, merchantId } });
@@ -404,6 +419,15 @@ export class PaymentsService {
    * has, and the caller maps the result to PublicPaymentViewDto which drops
    * every merchant-identifying and PII field.
    */
+  async findByReference(reference: string): Promise<Payment> {
+    const payment = await this.paymentsRepo.findOne({ where: { reference } });
+    if (!payment) throw new NotFoundException('Payment not found');
+    if (payment.expiresAt && new Date(payment.expiresAt).getTime() < Date.now()) {
+      throw new GoneException('This payment QR code has expired');
+    }
+    return payment;
+  }
+
   async findByReference(reference: string): Promise<Payment> {
     const payment = await this.paymentsRepo.findOne({ where: { reference } });
     if (!payment) throw new NotFoundException('Payment not found');
@@ -469,10 +493,10 @@ export class PaymentsService {
     await this.webhooks.dispatch(saved.merchantId, 'payment.confirmed', { id: saved.id, reference: saved.reference });
     return saved;
   }
+  }
 
   async refund(id: string, merchantId: string, dto: RefundPaymentDto): Promise<Payment> {
     const payment = await this.findOne(id, merchantId);
-
     if (payment.status !== PaymentStatus.SETTLED && payment.status !== PaymentStatus.PARTIALLY_REFUNDED) {
       throw new BadRequestException('Only settled payments can be refunded');
     }
@@ -581,6 +605,64 @@ export class PaymentsService {
       count: Number(row.count),
       totalUsd: Number(row.totalUsd),
     }));
+  }
+
+  // ── Internals ───────────────────────────────────────────────────────────────
+
+  private validateBatchItem(item: BatchPaymentItemDto, index: number): void {
+    if (!item || typeof item.amountUsd !== 'number' || !(item.amountUsd > 0)) {
+      throw new BadRequestException(`payments[${index}]: amountUsd must be greater than 0`);
+    }
+    if (typeof item.memo !== 'string' || item.memo.trim().length === 0) {
+      throw new BadRequestException(`payments[${index}]: memo must not be empty`);
+    }
+  }
+
+  private async buildPayment(
+    merchantId: string,
+    dto: CreatePaymentDto | BatchPaymentItemDto,
+  ): Promise<Payment> {
+    const reference = `PAY-${uuidv4().slice(0, 8).toUpperCase()}`;
+    const depositAddress = this.stellar.getDepositAddress();
+    const memo = this.stellar.generateMemo();
+    const expiryMinutes = Math.min(
+      dto.expiryMinutes ?? DEFAULT_EXPIRY_MINUTES,
+      MAX_EXPIRY_MINUTES,
+    );
+    const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
+
+    const payment = this.paymentRepository.create({
+      reference,
+      merchantId,
+      amountUsd: String(dto.amountUsd),
+      network: PaymentNetwork.STELLAR,
+      status: PaymentStatus.PENDING,
+      stellarDepositAddress: depositAddress,
+      stellarMemo: memo,
+      description: dto.memo,
+      customerEmail: dto.customerEmail,
+      metadata: dto.metadata,
+      expiresAt,
+    });
+
+    payment.qrCode = await this.generateQrCode(payment);
+
+    return payment;
+  }
+
+  private buildStellarUri(payment: Payment): string {
+    const params = new URLSearchParams({
+      destination: payment.stellarDepositAddress ?? '',
+      amount: payment.amountUsd,
+      memo: payment.stellarMemo ?? '',
+      memo_type: 'text',
+      msg: payment.description ?? '',
+    });
+    return `web+stellar:pay?${params.toString()}`;
+  }
+
+  private async generateQrCode(payment: Payment): Promise<string> {
+    return QRCode.toDataURL(this.buildStellarUri(payment));
   }
 }
   }
