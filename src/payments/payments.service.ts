@@ -356,6 +356,9 @@ export class PaymentsService {
       );
     }
 
+    // Release escrowed funds on-chain first; if this throws, DB state is untouched.
+    await this.soroban.refund(payment.id, payment.customerWalletAddress);
+
     const newRefundedUsd = alreadyRefundedUsd.plus(refundAmount);
     const previousStatus = payment.status;
     payment.refundAmountUsd = newRefundedUsd.toFixed(6);
@@ -436,6 +439,27 @@ export class PaymentsService {
     return payment;
   }
 
+  async getStats(merchantId: string): Promise<PaymentStatsDto[]> {
+    const rows = await this.paymentsRepo
+      .createQueryBuilder('payment')
+      .select('payment.status', 'status')
+      .addSelect('COUNT(*)', 'count')
+      .addSelect('SUM(payment.amountUsd)', 'totalUsd')
+      .where('payment.merchantId = :merchantId', { merchantId })
+      .groupBy('payment.status')
+      .getRawMany();
+
+    // Postgres returns COUNT/SUM as strings (e.g. "1234.000000"); convert to numbers for callers.
+    return rows.map((row) => ({
+      status: row.status,
+      count: Number(row.count
+      .createQueryBuilder('payment')
+      .select('payment.status', 'status')
+      .addSelect('COUNT(*)', 'count')
+      .addSelect('SUM(payment.amountUsd)', 'totalUsd')
+      .where('payment.merchantId = :merchantId', { merchantId })
+      .groupBy('payment.status')
+      .getRawMany();
   async getStats(merchantId: string): Promise<PaymentStatsDto[]> {
     const rows = await this.paymentsRepo
       .createQueryBuilder('payment')
