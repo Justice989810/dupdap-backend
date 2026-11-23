@@ -36,6 +36,7 @@ export enum PaymentNetwork {
 @Entity('payments')
 @Index(['merchantId', 'status'])
 @Index(['merchantId', 'createdAt'])
+@Index('UQ_payments_stellar_memo', ['stellarMemo'], { unique: true, where: '"stellarMemo" IS NOT NULL' })
 @Index('IDX_payments_status_expires_at', ['status', 'expiresAt'])
 // GIN index is created by migration 1772500000000; declared here so schema diffs don't drop it
 @Index('IDX_payments_metadata_gin', ['metadata'], { synchronize: false })
