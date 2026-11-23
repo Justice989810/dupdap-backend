@@ -47,6 +47,6 @@ import { AnalyticsExportController } from './analytics-export.controller';
   ],
   controllers: [AdminController, CronAdminController, EncryptionAdminController, AnalyticsExportController],
   providers: [AdminService, AuditService, IpAllowlistGuard, AnalyticsExportService],
-  exports: [AdminService, TypeOrmModule],
+  exports: [AdminService, TypeOrmModule, IpAllowlistGuard],
 })
 export class AdminModule {}

@@ -11,6 +11,8 @@ import {
   UseGuards,
   Headers,
   Res,
+  BadRequestException,
+  UnauthorizedException,
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
@@ -37,6 +39,17 @@ import { TokenBlacklistService } from '../auth/services/token-blacklist.service'
 const EXPORT_DAILY_LIMIT = Number(process.env.ANALYTICS_EXPORT_DAILY_LIMIT ?? 5);
 const EXPORT_SYNC_MAX_DAYS = 30;
 const EXPORT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const MIN_FEE_RATE = 0;
+const MAX_FEE_RATE = 0.1;
+
+// AML flag review state machine (#932): PENDING → REVIEWING → RESOLVED | ESCALATED
+const AML_FLAG_STATUS_TRANSITIONS: Record<string, string[]> = {
+  PENDING: ['REVIEWING'],
+  REVIEWING: ['RESOLVED', 'ESCALATED'],
+  RESOLVED: [],
+  ESCALATED: [],
+};
 
 @ApiTags('admin')
 @ApiBearerAuth()
@@ -142,6 +155,7 @@ export class AdminController {
     @Body() dto: UpdateFeeDto,
     @Req() req: Request & { user: { id: string; merchantId?: string } },
   ) {
+    this.assertFeeRateInBounds(dto.newRate);
     const actorId = req.user.id ?? req.user?.merchantId ?? 'system';
     const before = await this.adminService.getGlobalFees();
     const result = await this.adminService.updateGlobalFee(
@@ -207,6 +221,76 @@ export class AdminController {
       dto,
       req.user?.id ?? req.user?.merchantId ?? 'system',
     );
+  }
+
+  private assertFeeRateInBounds(rate: number): void {
+    if (
+      typeof rate !== 'number' ||
+      Number.isNaN(rate) ||
+      rate < MIN_FEE_RATE ||
+      rate > MAX_FEE_RATE
+    ) {
+      throw new BadRequestException(
+        `Fee rate must be between ${MIN_FEE_RATE} and ${MAX_FEE_RATE} (inclusive)`,
+      );
+    }
+  }
+
+  // ── AML Flag Review (#932) ─────────────────────────────────────────────────
+
+  @Patch('aml-flags/:id/review')
+  @Auditable({ action: 'AML_FLAG_REVIEWED', resource: 'aml_flag' })
+  @ApiOperation({ summary: 'Review an AML flag and transition its status' })
+  reviewAmlFlag(
+    @Param('id') id: string,
+    @Body('status') status: string,
+    @Body('currentStatus') currentStatus: string,
+    @Req() req: Request & { user: { id: string; merchantId?: string } },
+  ) {
+    this.assertValidAmlFlagTransition(currentStatus, status);
+    return this.adminService.reviewAmlFlag(
+      id,
+      status,
+      req.user?.id ?? req.user?.merchantId,
+    );
+  }
+
+  private assertValidAmlFlagTransition(from: string, to: string): void {
+    const allowed = AML_FLAG_STATUS_TRANSITIONS[from];
+    if (!allowed) {
+      throw new BadRequestException(`Unknown AML flag status: ${from}`);
+    }
+    if (!allowed.includes(to)) {
+      throw new BadRequestException(
+        `Invalid AML flag status transition: ${from} → ${to}. ` +
+          `Allowed from ${from}: ${allowed.length ? allowed.join(', ') : 'none'}`,
+      );
+    }
+  }
+
+  // ── Metrics (#936) ─────────────────────────────────────────────────────────
+
+  @Get('metrics')
+  @ApiOperation({ summary: 'Prometheus metrics (admin IP allowlist + bearer token required)' })
+  getMetrics(@Headers('authorization') authorization?: string) {
+    this.assertMetricsBearerToken(authorization);
+    return this.adminService.getMetrics();
+  }
+
+  private assertMetricsBearerToken(authorization?: string): void {
+    const expected = process.env.METRICS_BEARER_TOKEN;
+    if (!expected) {
+      // Fail closed: without a configured token, metrics must not be served.
+      throw new UnauthorizedException('Metrics access is not configured');
+    }
+    const prefix = 'Bearer ';
+    const provided =
+      authorization && authorization.startsWith(prefix)
+        ? authorization.slice(prefix.length).trim()
+        : undefined;
+    if (!provided || provided !== expected) {
+      throw new UnauthorizedException('Invalid or missing metrics bearer token');
+    }
   }
 
   // ── Cache Management ──────────────────────────────────────────────────────
@@ -379,9 +463,14 @@ export class AdminController {
   updateAdminRole(
     @Param('id') id: string,
     @Body('role') role: MerchantRole,
-    @Req() req: Request & { user: { id: string; merchantId: string; role: MerchantRole } },
+    @Req() req: Request & { user: { id: string; merchantId?: string; role: MerchantRole } },
   ) {
-    return this.adminService.updateAdminRole(id, role, req.user.role, req.user.id ?? req.user.merchantId);
+    return this.adminService.updateAdminRole(
+      id,
+      role,
+      req.user.role,
+      req.user?.id ?? req.user?.merchantId,
+    );
   }
 
   @Post('users/:id/2fa/setup')
