@@ -25,12 +25,6 @@ import { WebhooksService } from '../webhooks/webhooks.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { MerchantsService } from '../merchants/merchants.service';
 import { PaginatedResponseDto } from '../common/dto/pagination.dto';
-import { PaymentEscrowService, PaymentExpiredError } from '../blockch
-import { StellarService } from '../stellar/stellar.service';
-import { WebhooksService } from '../webhooks/webhooks.service';
-import { NotificationsService } from '../notifications/notifications.service';
-import { MerchantsService } from '../merchants/merchants.service';
-import { PaginatedResponseDto } from '../common/dto/pagination.dto';
 import { PaymentEscrowService, PaymentExpiredError } from '../blockchain-wallet/payment-escrow.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { AmlService } from '../aml/aml.service';
@@ -79,19 +73,23 @@ export class PaymentsService {
     eventType: PaymentEventType,
     previousStatus: PaymentStatus | null,
     newStatus: PaymentStatus | null,
-    actorId?: string,
+    actorId?: string | null,
     metadata?: Record<string, any>,
   ): Promise<void> {
-    await this.eventsRepo.save(
-      this.eventsRepo.create({
-        paymentId,
-        eventType,
-        previousStatus,
-        newStatus,
-        actorId: actorId ?? null,
-        metadata: metadata ?? null,
-      }),
-    );
+    try {
+      await this.eventsRepo.save(
+        this.eventsRepo.create({
+          paymentId,
+          eventType,
+          previousStatus,
+          newStatus,
+          actorId: actorId ?? null,
+          metadata: metadata ?? null,
+        }),
+      );
+    } catch (err) {
+      this.logger.warn(`Failed to record ${eventType} event for payment ${paymentId}: ${(err as Error).message}`);
+    }
   }
 
   /** Immutable event log for audit/debugging (no updates/deletes). */
@@ -104,7 +102,6 @@ export class PaymentsService {
   }
 
   /**
-   *
    * getXlmUsdRate() now returns { rate, isFallback }. A fallback rate is a
    * fabricated/stale constant and must never be used to quote a deposit
    * amount, so we refuse the request instead of mispricing the payment.
@@ -198,6 +195,7 @@ export class PaymentsService {
   async confirmPayment(
     paymentId: string,
     customerAddress: string,
+    txHash?: string,
   ): Promise<Payment> {
     const payment = await this.paymentsRepo.findOne({ where: { id: paymentId } });
     if (!payment) throw new NotFoundException('Payment not found');
@@ -217,37 +215,38 @@ export class PaymentsService {
       throw err;
     }
 
-    payment.status = PaymentStatus.CONFIRMED;
-    payment.customerWalletAddress = customerAddress;
-    payment.confirmedAt = new Date();
-    const saved = await this.paymentsRepo.save(payment);
-    await this.recordEvent(paymentId, PaymentEventType.CONFIRMED, PaymentStatus.PENDING, PaymentStatus.CONFIRMED, undefined, { customerAddress });
-
-    // Invalidate merchant analytics caches since funnel and comparison data may have changed.
-    this.analytics.clearCacheForMerchant(payment.merchantId);
-
-    return saved;
+    return this.applyConfirmation(payment, customerAddress, txHash);
   }
 
-  async applySorobanPaymentConfirmed(event: { paymentReference: string; txHash?: string; amount?: number; asset?: string; from?: string }): Promise<void> {
-    const payment = await this.paymentsRepo.findOne({ where: { id: event.paymentReference } });
+  async applySorobanPaymentConfirmed(event: PaymentConfirmedEventDto): Promise<void> {
+    const payment = await this.paymentsRepo.findOne({ where: { reference: event.paymentReference } });
     if (!payment) {
-      this.logger.warn(`Soroban payment confirmed for unknown payment ${event.paymentReference}`);
+      this.logger.warn(`Soroban confirmation for unknown payment reference ${event.paymentReference}`);
       return;
     }
+    if (payment.status !== PaymentStatus.PENDING) return;
+    await this.applyConfirmation(payment, event.from ?? payment.customerWalletAddress, event.txHash);
+  }
 
-    if (payment.status === PaymentStatus.CONFIRMED) {
-      return;
-    }
-
+  private async applyConfirmation(payment: Payment, customerWalletAddress: string, txHash?: string): Promise<Payment> {
+    const previous = payment.status;
     payment.status = PaymentStatus.CONFIRMED;
+    payment.customerWalletAddress = customerWalletAddress;
     payment.confirmedAt = new Date();
-    if (event.txHash) payment.txHash = event.txHash;
-    if (event.from) payment.customerWalletAddress = event.from;
-    await this.paymentsRepo.save(payment);
-    await this.recordEvent(payment.id, PaymentEventType.CONFIRMED, PaymentStatus.PENDING, PaymentStatus.CONFIRMED, undefined, { txHash: event.txHash });
+    if (txHash) payment.txHash = txHash;
 
-    this.analytics.clearCacheForMerchant(payment.merchantId);
+    const saved = await this.paymentsRepo.save(payment);
+    await this.recordEvent(saved.id, PaymentEventType.CONFIRMED, previous, saved.status, null);
+    this.analytics.clearCacheForMerchant(saved.merchantId);
+
+    try {
+      await this.aml.checkAndFlag(saved);
+    } catch (err) {
+      this.logger.error(`AML check failed for payment ${saved.id}: ${(err as Error).message}`);
+    }
+
+    await this.webhooks.dispatch(saved.merchantId, 'payment.confirmed', { id: saved.id, reference: saved.reference });
+    return saved;
   }
 
   /**
@@ -257,14 +256,7 @@ export class PaymentsService {
    * registration fails, nothing is persisted.
    */
   async createBatch(merchantId: string, dto: BatchCreatePaymentDto): Promise<BatchPaymentResultDto> {
-    dto.payments.forEach((item, i) => {
-      if (!(item.amountUsd > 0)) {
-        throw new BadRequestException(`payments[${i}]: amountUsd must be greater than 0`);
-      }
-      if (!item.memo || !item.memo.trim()) {
-        throw new BadRequestException(`payments[${i}]: memo must not be empty`);
-      }
-    });
+    dto.payments.forEach((item, i) => this.validateBatchItem(item, i));
 
     const records: Payment[] = [];
     for (const [i, item] of dto.payments.entries()) {
@@ -307,14 +299,18 @@ export class PaymentsService {
     paymentId: string,
     dto: RefundPaymentDto,
   ): Promise<Payment> {
-    const payment = await this.findOne(merchantId, paymentId);
-    if (!payment) throw new NotFoundException('Payment not found');
+    const payment = await this.findOne(paymentId, merchantId);
 
     if (
       payment.status !== PaymentStatus.CONFIRMED &&
+      payment.status !== PaymentStatus.SETTLED &&
       payment.status !== PaymentStatus.PARTIALLY_REFUNDED
     ) {
-      throw new BadRequestException('Only confirmed payments can be refunded');
+      throw new BadRequestException('Only confirmed or settled payments can be refunded');
+    }
+
+    if (payment.metadata?.hold) {
+      throw new BadRequestException('Payment is on hold and cannot be refunded');
     }
 
     if (!payment.customerWalletAddress) {
@@ -326,9 +322,9 @@ export class PaymentsService {
     const refundAmount =
       dto.amountUsd !== undefined ? new Big(dto.amountUsd) : remainingUsd;
 
-    if (refundAmount.gt(remainingUsd)) {
+    if (refundAmount.lte(0) || refundAmount.gt(remainingUsd)) {
       throw new BadRequestException(
-        `Refund amount exceeds remaining refundable balance of ${remainingUsd.toFixed(6)}`,
+        `Refund amount must be between 0.01 and ${remainingUsd.toFixed(6)}`,
       );
     }
 
@@ -345,8 +341,8 @@ export class PaymentsService {
     payment.refundReason = dto.reason;
     payment.refundedAt = new Date();
 
-    const saved2 = await this.paymentsRepo.save(payment);
-    await this.recordEvent(payment.id, PaymentEventType.REFUNDED, previousStatus, payment.status, merchantId, { refundAmountUsd: dto.amountUsd });
+    const saved = await this.paymentsRepo.save(payment);
+    await this.recordEvent(payment.id, PaymentEventType.REFUNDED, previousStatus, payment.status, merchantId, { refundAmountUsd: refundAmount.toFixed(6) });
 
     await this.webhooks.dispatch(payment.merchantId, 'payment.refunded', {
       paymentId: payment.id,
@@ -359,7 +355,7 @@ export class PaymentsService {
 
     this.analytics.clearCacheForMerchant(payment.merchantId);
 
-    return saved2;
+    return saved;
   }
 
   /**
@@ -394,17 +390,22 @@ export class PaymentsService {
     };
   }
 
-  async getStats(merchantId: string) {
-    const rows: { status: PaymentStatus; count: string; total: string }[] = await this.paymentsRepo
-      .createQueryBuilder('p')
-      .select('p.status', 'status')
+  async getStats(merchantId: string): Promise<PaymentStatsDto[]> {
+    const rows = await this.paymentsRepo
+      .createQueryBuilder('payment')
+      .select('payment.status', 'status')
       .addSelect('COUNT(*)', 'count')
-      .addSelect('COALESCE(SUM(p.amountUsd), 0)', 'total')
-      .where('p.merchantId = :merchantId', { merchantId })
-      .groupBy('p.status')
+      .addSelect('SUM(payment.amountUsd)', 'totalUsd')
+      .where('payment.merchantId = :merchantId', { merchantId })
+      .groupBy('payment.status')
       .getRawMany();
 
-    return rows.map((r) => ({ status: r.status, count: Number(r.count), totalUsd: r.total }));
+    // Postgres returns COUNT/SUM as strings (e.g. "1234.000000"); convert to numbers for callers.
+    return rows.map((row) => ({
+      status: row.status,
+      count: Number(row.count),
+      totalUsd: Number(row.totalUsd),
+    }));
   }
 
   async findOne(id: string, merchantId: string): Promise<Payment> {
@@ -428,22 +429,6 @@ export class PaymentsService {
     return payment;
   }
 
-  async findByReference(reference: string): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({ where: { reference } });
-    if (!payment) throw new NotFoundException('Payment not found');
-    if (payment.expiresAt && new Date(payment.expiresAt).getTime() < Date.now()) {
-      throw new GoneException('This payment QR code has expired');
-    }
-    return payment;
-  }
-
-  async getHistory(id: string, merchantId: string): Promise<PaymentEvent[]> {
-    await this.findOne(id, merchantId);
-    return this.paymentsRepo.manager
-      .getRepository(PaymentEvent)
-      .find({ where: { paymentId: id }, order: { timestamp: 'ASC' } });
-  }
-
   async cancel(id: string, merchantId: string): Promise<Payment> {
     const payment = await this.findOne(id, merchantId);
     if (payment.status !== PaymentStatus.PENDING) {
@@ -454,90 +439,6 @@ export class PaymentsService {
     const saved = await this.paymentsRepo.save(payment);
     await this.recordEvent(id, PaymentEventType.CANCELLED, previous, saved.status, merchantId);
     await this.webhooks.dispatch(merchantId, 'payment.cancelled', { id, reference: saved.reference });
-    return saved;
-  }
-
-  async confirmPayment(id: string, customerWalletAddress: string, txHash?: string): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({ where: { id } });
-    if (!payment) throw new NotFoundException('Payment not found');
-    return this.applyConfirmation(payment, customerWalletAddress, txHash);
-  }
-
-  async applySorobanPaymentConfirmed(event: PaymentConfirmedEventDto): Promise<void> {
-    const payment = await this.paymentsRepo.findOne({ where: { reference: event.paymentReference } });
-    if (!payment) {
-      this.logger.warn(`Soroban confirmation for unknown payment reference ${event.paymentReference}`);
-      return;
-    }
-    if (payment.status !== PaymentStatus.PENDING) return;
-    await this.applyConfirmation(payment, event.from ?? payment.customerWalletAddress, event.txHash);
-  }
-
-  private async applyConfirmation(payment: Payment, customerWalletAddress: string, txHash?: string): Promise<Payment> {
-    const previous = payment.status;
-    payment.status = PaymentStatus.CONFIRMED;
-    payment.customerWalletAddress = customerWalletAddress;
-    payment.confirmedAt = new Date();
-    if (txHash) payment.txHash = txHash;
-
-    const saved = await this.paymentsRepo.save(payment);
-    await this.recordEvent(saved.id, PaymentEventType.CONFIRMED, previous, saved.status, null);
-    this.analytics.clearCacheForMerchant(saved.merchantId);
-
-    try {
-      await this.aml.checkAndFlag(saved);
-    } catch (err) {
-      this.logger.error(`AML check failed for payment ${saved.id}: ${(err as Error).message}`);
-    }
-
-    await this.webhooks.dispatch(saved.merchantId, 'payment.confirmed', { id: saved.id, reference: saved.reference });
-    return saved;
-  }
-  }
-
-  async refund(id: string, merchantId: string, dto: RefundPaymentDto): Promise<Payment> {
-    const payment = await this.findOne(id, merchantId);
-    if (payment.status !== PaymentStatus.SETTLED && payment.status !== PaymentStatus.PARTIALLY_REFUNDED) {
-      throw new BadRequestException('Only settled payments can be refunded');
-    }
-    if (payment.metadata?.hold) {
-      throw new BadRequestException('Payment is on hold and cannot be refunded');
-    }
-    if (!payment.customerWalletAddress) {
-      throw new BadRequestException('Customer wallet address is unknown; cannot refund');
-    }
-
-    const alreadyRefunded = Number(payment.refundAmountUsd ?? 0);
-    const remaining = Number(payment.amountUsd) - alreadyRefunded;
-    const amount = dto.amountUsd ?? remaining;
-    if (amount <= 0 || amount > remaining + 1e-9) {
-      throw new BadRequestException(`Refund amount must be between 0.01 and ${remaining.toFixed(6)}`);
-    }
-
-    const merchant = await this.merchants.findOne(merchantId);
-    const txHash = await this.stellar.sendPayment(
-      payment.customerWalletAddress,
-      amount.toFixed(7),
-      this.stellar.getUsdcAsset(),
-      `REFUND-${payment.reference.replace(/^PAY-/, '')}`,
-    );
-
-    const previous = payment.status;
-    payment.status = PaymentStatus.REFUNDED;
-    payment.refundAmountUsd = (alreadyRefunded + amount).toFixed(6);
-    payment.refundReason = dto.reason;
-    payment.refundTxHash = txHash;
-    payment.refundedAt = new Date();
-    const saved = await this.paymentsRepo.save(payment);
-
-    await this.recordEvent(id, PaymentEventType.REFUNDED, previous, saved.status, merchantId, { amountUsd: amount });
-    await this.webhooks.dispatch(merchantId, 'payment.refunded', { id, reference: saved.reference, amountUsd: amount });
-
-    const text = `Payment ${saved.reference} was refunded ${amount.toFixed(2)} USD. Reason: ${dto.reason}`;
-    await this.notifications.enqueueEmail({ recipient: merchant.email, subject: 'Payment refunded', text });
-    if (saved.customerEmail) {
-      await this.notifications.enqueueEmail({ recipient: saved.customerEmail, subject: 'Your payment was refunded', text });
-    }
     return saved;
   }
 
@@ -572,41 +473,6 @@ export class PaymentsService {
     return saved;
   }
 
-  /** Best-effort audit trail; never fails the payment operation. */
-  private async recordEvent(
-    paymentId: string,
-    eventType: PaymentEventType,
-    previousStatus: PaymentStatus | null,
-    newStatus: PaymentStatus | null,
-    actorId: string | null,
-    metadata?: Record<string, any>,
-  ): Promise<void> {
-    try {
-      const repo = this.paymentsRepo.manager.getRepository(PaymentEvent);
-      await repo.save(repo.create({ paymentId, eventType, previousStatus, newStatus, actorId: actorId ?? undefined, metadata }));
-    } catch (err) {
-      this.logger.warn(`Failed to record ${eventType} event for payment ${paymentId}: ${(err as Error).message}`);
-    }
-  }
-
-  async getStats(merchantId: string): Promise<PaymentStatsDto[]> {
-    const rows = await this.paymentsRepo
-      .createQueryBuilder('payment')
-      .select('payment.status', 'status')
-      .addSelect('COUNT(*)', 'count')
-      .addSelect('SUM(payment.amountUsd)', 'totalUsd')
-      .where('payment.merchantId = :merchantId', { merchantId })
-      .groupBy('payment.status')
-      .getRawMany();
-
-    // Postgres returns COUNT/SUM as strings (e.g. "1234.000000"); convert to numbers for callers.
-    return rows.map((row) => ({
-      status: row.status,
-      count: Number(row.count),
-      totalUsd: Number(row.totalUsd),
-    }));
-  }
-
   // ── Internals ───────────────────────────────────────────────────────────────
 
   private validateBatchItem(item: BatchPaymentItemDto, index: number): void {
@@ -616,38 +482,6 @@ export class PaymentsService {
     if (typeof item.memo !== 'string' || item.memo.trim().length === 0) {
       throw new BadRequestException(`payments[${index}]: memo must not be empty`);
     }
-  }
-
-  private async buildPayment(
-    merchantId: string,
-    dto: CreatePaymentDto | BatchPaymentItemDto,
-  ): Promise<Payment> {
-    const reference = `PAY-${uuidv4().slice(0, 8).toUpperCase()}`;
-    const depositAddress = this.stellar.getDepositAddress();
-    const memo = this.stellar.generateMemo();
-    const expiryMinutes = Math.min(
-      dto.expiryMinutes ?? DEFAULT_EXPIRY_MINUTES,
-      MAX_EXPIRY_MINUTES,
-    );
-    const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
-
-    const payment = this.paymentRepository.create({
-      reference,
-      merchantId,
-      amountUsd: String(dto.amountUsd),
-      network: PaymentNetwork.STELLAR,
-      status: PaymentStatus.PENDING,
-      stellarDepositAddress: depositAddress,
-      stellarMemo: memo,
-      description: dto.memo,
-      customerEmail: dto.customerEmail,
-      metadata: dto.metadata,
-      expiresAt,
-    });
-
-    payment.qrCode = await this.generateQrCode(payment);
-
-    return payment;
   }
 
   private buildStellarUri(payment: Payment): string {
@@ -664,6 +498,5 @@ export class PaymentsService {
   private async generateQrCode(payment: Payment): Promise<string> {
     return QRCode.toDataURL(this.buildStellarUri(payment));
   }
-}
   }
 }
