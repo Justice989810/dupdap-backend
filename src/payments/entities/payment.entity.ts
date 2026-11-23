@@ -33,6 +33,7 @@ export enum PaymentNetwork {
 @Entity('payments')
 @Index(['merchantId', 'status'])
 @Index(['merchantId', 'createdAt'])
+@Index('IDX_payments_status_expires_at', ['status', 'expiresAt'])
 // GIN index is created by migration 1772500000000; declared here so schema diffs don't drop it
 @Index('IDX_payments_metadata_gin', ['metadata'], { synchronize: false })
 @Check('CHK_payments_amount_usd_positive', '"amountUsd" > 0')
@@ -104,6 +105,7 @@ export class Payment {
   @Column({ nullable: true })
   settlementCurrency: string;
 
+  @Index('IDX_payments_expires_at')
   @Column({ nullable: true })
   expiresAt: Date;
 
