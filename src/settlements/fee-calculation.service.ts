@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
+import Big from 'big.js';
 import { MerchantsService } from '../merchants/merchants.service';
 
 export interface FeeResult {
@@ -26,36 +27,42 @@ const FEE_TIERS: FeeTier[] = [
 export class FeeCalculationService {
   constructor(private readonly merchantsService: MerchantsService) {}
 
-  async calculateFee(merchantId: string, amountUsd: number): Promise<FeeResult> {
-    if (!Number.isFinite(amountUsd) || amountUsd < 0) {
+  async calculateFee(merchantId: string, amountUsd: string | number): Promise<FeeResult> {
+    let amount: Big;
+    try {
+      amount = new Big(amountUsd);
+    } catch {
+      throw new BadRequestException(`Invalid amount for merchant ${merchantId}: ${amountUsd}`);
+    }
+    if (amount.lt(0)) {
       throw new BadRequestException(`Invalid amount for merchant ${merchantId}: ${amountUsd}`);
     }
 
     const merchant = await this.merchantsService.findOne(merchantId);
-    const tier = this.resolveTier(amountUsd);
+    const tier = this.resolveTier(amount);
     // Merchant override wins; null means the tier default applies.
-    const rate = merchant.customFeeRate != null ? Number(merchant.customFeeRate) : tier.rate;
-    const feeUsd = this.round(amountUsd * rate);
-    const netUsd = this.round(amountUsd - feeUsd);
+    const rate = merchant.customFeeRate != null ? new Big(merchant.customFeeRate) : new Big(tier.rate);
+    const feeUsd = this.round(amount.times(rate));
+    const netUsd = this.round(amount.minus(feeUsd));
 
     return {
-      feeUsd,
-      feeRate: rate,
+      feeUsd: feeUsd.toNumber(),
+      feeRate: rate.toNumber(),
       tierName: tier.name,
-      netUsd,
+      netUsd: netUsd.toNumber(),
     };
   }
 
-  private resolveTier(amountUsd: number): FeeTier {
+  private resolveTier(amount: Big): FeeTier {
     for (const tier of FEE_TIERS) {
-      if (amountUsd >= tier.minUsd && (tier.maxUsd === null || amountUsd < tier.maxUsd)) {
+      if (amount.gte(tier.minUsd) && (tier.maxUsd === null || amount.lt(tier.maxUsd))) {
         return tier;
       }
     }
     return FEE_TIERS[FEE_TIERS.length - 1];
   }
 
-  private round(value: number): number {
-    return Math.round(value * 100) / 100;
+  private round(value: Big): Big {
+    return value.round(2, Big.roundHalfUp);
   }
 }
